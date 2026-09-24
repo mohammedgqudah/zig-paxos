@@ -14,7 +14,7 @@ pub fn Bounded(comptime T: type, comptime capacity: usize) type {
             return self;
         }
 
-        pub fn slice(self: *Self) []T {
+        pub fn slice(self: *const Self) []const T {
             return self.buffer[0..self.len];
         }
 
@@ -23,8 +23,8 @@ pub fn Bounded(comptime T: type, comptime capacity: usize) type {
             self.buffer[self.len] = item;
             self.len += 1;
         }
-        
-        pub fn contains(self: *Self, item: T) bool {
+
+        pub fn contains(self: *const Self, item: T) bool {
             return std.mem.findScalar(T, self.slice(), item) != null;
         }
     };

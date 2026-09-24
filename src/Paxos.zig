@@ -1,10 +1,10 @@
 const std = @import("std");
-const BoundedArray = @import("BoundedArray.zig");
+const State = @import("State.zig").State;
 const testing = std.testing;
 
-const NodeId = u16;
-const Counter = u48;
-const ProposalNumber = packed struct(u64) {
+pub const NodeId = u16;
+pub const Counter = u48;
+pub const ProposalNumber = packed struct(u64) {
     const Self = @This();
 
     node_id: NodeId,
@@ -15,6 +15,13 @@ const ProposalNumber = packed struct(u64) {
     }
 };
 
+pub fn LastAccepted(comptime T: type) type {
+    return struct {
+        proposal_number: ProposalNumber,
+        value: T,
+    };
+}
+
 /// A Paxos type to reach consensus for a value of type `T`.
 ///
 /// This is a low-level implementation of the protocol, transport is handled separately.
@@ -22,292 +29,300 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
     return struct {
         const Self = @This();
 
-        const Prepare = struct {
+        pub const PaxosState = State(T, N);
+
+        pub const Prepare = struct {
             proposal_number: ProposalNumber,
         };
 
-        const Promise = struct {
+        pub const Promise = struct {
             proposal_number: ProposalNumber,
             acceptor: NodeId,
-            last_accepted: ?LastAccepted,
+            last_accepted: ?LastAccepted(T),
         };
 
-        const Accept = struct {
+        pub const Accept = struct {
             proposal_number: ProposalNumber,
             value: T,
         };
 
-        const Learn = struct {
+        pub const Learn = struct {
             proposal_number: ProposalNumber,
             value: T,
             acceptor: NodeId,
         };
 
-        const LastAccepted = struct {
-            proposal_number: ProposalNumber,
-            value: T,
-        };
-
-        const LearnerState = struct {
-            /// The we're learning about
-            number: ProposalNumber,
-            /// The value we're learning
-            value: T,
-            /// Nodes who have accepted this round (i.e. sent a Learn request)
-            acceptors: BoundedArray.Bounded(NodeId, N),
-        };
+        pub const ProposeResult = struct { state: PaxosState, prepare: Prepare };
+        pub const PrepareResult = struct { state: PaxosState, promise: ?Promise };
+        pub const PromiseResult = struct { state: PaxosState, accept: ?Accept };
+        pub const AcceptResult = struct { state: PaxosState, learn: ?Learn };
 
         id: NodeId,
-        proposal_number: ProposalNumber,
         peers: []const NodeId,
+        state: PaxosState,
 
-        /// the value agreed on
-        value: ?T = null,
-
-        /// role: proposer
-        /// the proposed value from this node
-        proposed_value: ?T = null,
-        /// The number of promises for our current proposal
-        promises: BoundedArray.Bounded(NodeId, N) = .{},
-        /// Store the highest-numbered accepted proposal that acceptors report
-        /// back in their promise.
-        /// "it responds to the request [...] with the highest-numbered proposal (if any) that it has accepted."
-        best_accepted: ?LastAccepted = null,
-
-        /// role: acceptor
-        /// The promised proposal number
-        promised_number: ?ProposalNumber = null,
-        accepted: ?LastAccepted = null,
-
-        /// role: learning
-        /// the value we're learning
-        learningValue: ?LearnerState = null,
-
-        pub fn init(
-            node_id: NodeId,
-            peers: []const NodeId,
-        ) Self {
+        pub fn init(node_id: NodeId, peers: []const NodeId) Self {
             return .{
                 .id = node_id,
-                .proposal_number = .{
-                    .node_id = node_id,
-                    .counter = 0,
-                },
                 .peers = peers,
-                .value = null,
+                .state = PaxosState.init(node_id),
             };
+        }
+
+        fn withState(self: *const Self, s: PaxosState) Self {
+            return .{ .id = self.id, .peers = self.peers, .state = s };
         }
 
         /// Propose a value to peers.
         /// The caller should forward the `Prepare` command.
-        pub fn propose(self: *Self, value: T) Prepare {
-            self.proposed_value = value;
-            self.promises = .{};
-            self.proposal_number.counter += 1;
-            const reply: Prepare = .{
-                .proposal_number = self.proposal_number,
-            };
+        pub fn propose(self: *const Self, value: T) ProposeResult {
+            var node = self.withState(self.state);
+            node.state.proposed = value;
+            node.state.promises = .{};
+            node.state.round.counter += 1;
+            const prepare_cmd: Prepare = .{ .proposal_number = node.state.round };
+
             // self-promise, but only if we haven't promised a higher numbered round.
-            if (self.prepare(reply)) |p| {
-                _ = self.promise(p);
+            const prepared = node.prepare(prepare_cmd);
+            node.state = prepared.state;
+            if (prepared.promise) |self_promise| {
+                node.state = node.promise(self_promise).state;
             }
-            return reply;
+            return .{ .state = node.state, .prepare = prepare_cmd };
         }
 
         /// role: acceptor
         /// Recieve a prepare command, and potentionally promise the proposer.
-        pub fn prepare(self: *Self, cmd: Prepare) ?Promise {
-            if (self.promised_number == null or cmd.proposal_number.asInt() > self.promised_number.?.asInt()) {
-                self.promised_number = cmd.proposal_number;
+        pub fn prepare(self: *const Self, cmd: Prepare) PrepareResult {
+            var s = self.state;
+            if (s.promised == null or cmd.proposal_number.asInt() > s.promised.?.asInt()) {
+                s.promised = cmd.proposal_number;
                 return .{
-                    .acceptor = self.id,
-                    .proposal_number = cmd.proposal_number,
-                    .last_accepted = self.accepted,
-                };
-            } else {
-                return null;
-            }
-        }
-
-        pub fn accept(self: *Self, cmd: Accept) ?Learn {
-            // make sure we haven't promised a higher-numbered proposal
-            if (self.promised_number) |promised_number| {
-                if (promised_number.asInt() > cmd.proposal_number.asInt()) {
-                    return null;
-                }
-            }
-            self.accepted = .{
-                .proposal_number = cmd.proposal_number,
-                .value = cmd.value,
-            };
-            const reply: Learn = .{
-                .proposal_number = cmd.proposal_number,
-                .value = cmd.value,
-                .acceptor = self.id,
-            };
-            _ = self.learn(reply);
-            return reply;
-        }
-
-        pub fn learn(self: *Self, cmd: Learn) void {
-            if (self.learningValue) |*learning| {
-                // ignore duplicate
-                if (learning.acceptors.contains(cmd.acceptor))
-                    return;
-                switch (std.math.order(cmd.proposal_number.asInt(), learning.number.asInt())) {
-                    .gt => {
-                        self.learningValue = .{
-                            .acceptors = .initOne(cmd.acceptor),
-                            .value = cmd.value,
-                            .number = cmd.proposal_number,
-                        };
+                    .state = s,
+                    .promise = .{
+                        .proposal_number = cmd.proposal_number,
+                        .acceptor = self.id,
+                        .last_accepted = s.accepted,
                     },
-                    .eq => {
-                        learning.acceptors.append(cmd.acceptor) catch unreachable;
-                    },
-                    .lt => {},
-                }
-                if (learning.acceptors.len == self.majority()) {
-                    self.value = cmd.value;
-                }
-            } else {
-                self.learningValue = .{
-                    .acceptors = .initOne(cmd.acceptor),
-                    .value = cmd.value,
-                    .number = cmd.proposal_number,
                 };
             }
-        }
-
-        pub fn majority(self: *const Self) usize {
-            return (self.peers.len + 1) / 2 + 1;
+            return .{ .state = s, .promise = null };
         }
 
         /// role: proposer
         /// Recieve a promise for a proposal and send
         /// an `Accept` command once the majority has promised.
-        pub fn promise(self: *Self, cmd: Promise) ?Accept {
+        pub fn promise(self: *const Self, cmd: Promise) PromiseResult {
+            var s = self.state;
+
             // ignore stale promises
-            if (cmd.proposal_number != self.proposal_number)
-                return null;
+            if (cmd.proposal_number != s.round) return .{ .state = s, .accept = null };
 
             // ignore duplicate messages
-            if (self.promises.contains(cmd.acceptor))
-                return null;
-            self.promises.append(cmd.acceptor) catch unreachable;
+            if (s.promises.contains(cmd.acceptor)) return .{ .state = s, .accept = null };
+            s.promises.append(cmd.acceptor) catch return .{ .state = s, .accept = null };
 
             // store the highest-numbered accepted proposal from
             // all responses.
-            if (self.best_accepted) |best_accepted| {
-                if (cmd.last_accepted) |last_accepted| {
-                    if (last_accepted.proposal_number.asInt() > best_accepted.proposal_number.asInt()) {
-                        self.best_accepted = last_accepted;
+            if (cmd.last_accepted) |last_accepted| {
+                if (s.best_accepted) |best| {
+                    if (last_accepted.proposal_number.asInt() > best.proposal_number.asInt()) {
+                        s.best_accepted = last_accepted;
                     }
+                } else {
+                    s.best_accepted = last_accepted;
                 }
-            } else if (cmd.last_accepted) |last_accepted| {
-                self.best_accepted = last_accepted;
             }
 
-            if (self.promises.len == self.majority()) {
-                const reply: Accept = .{
-                    .proposal_number = cmd.proposal_number,
-                    // either send our proposed value, or propagate the value of the highest
-                    // previous round.
-                    .value = if (self.best_accepted) |best_accepted|
-                        best_accepted.value
-                    else
-                        self.proposed_value.?,
+            if (s.promises.len != self.majority()) return .{ .state = s, .accept = null };
+
+            const accept_cmd: Accept = .{
+                .proposal_number = cmd.proposal_number,
+                // either send our proposed value, or propagate the value of the highest
+                // previous round.
+                .value = if (s.best_accepted) |best| best.value else s.proposed.?,
+            };
+            var node = self.withState(s);
+            node.state = node.accept(accept_cmd).state;
+            return .{ .state = node.state, .accept = accept_cmd };
+        }
+
+        pub fn accept(self: *const Self, cmd: Accept) AcceptResult {
+            var s = self.state;
+
+            // make sure we haven't promised a higher-numbered proposal
+            if (s.promised) |promised| {
+                if (promised.asInt() > cmd.proposal_number.asInt()) {
+                    return .{ .state = s, .learn = null };
+                }
+            }
+
+            s.accepted = .{ .proposal_number = cmd.proposal_number, .value = cmd.value };
+            const learn_cmd: Learn = .{
+                .proposal_number = cmd.proposal_number,
+                .value = cmd.value,
+                .acceptor = self.id,
+            };
+            var node = self.withState(s);
+            node.state = node.learn(learn_cmd);
+            return .{ .state = node.state, .learn = learn_cmd };
+        }
+
+        pub fn learn(self: *const Self, cmd: Learn) PaxosState {
+            var s = self.state;
+
+            if (s.learning) |*learning| {
+                // ignore duplicate
+                if (learning.acceptors.contains(cmd.acceptor)) return s;
+                switch (std.math.order(cmd.proposal_number.asInt(), learning.number.asInt())) {
+                    .gt => s.learning = .{
+                        .number = cmd.proposal_number,
+                        .value = cmd.value,
+                        .acceptors = PaxosState.Acceptors.initOne(cmd.acceptor),
+                    },
+                    .eq => learning.acceptors.append(cmd.acceptor) catch {},
+                    .lt => return s,
+                }
+            } else {
+                s.learning = .{
+                    .number = cmd.proposal_number,
+                    .value = cmd.value,
+                    .acceptors = PaxosState.Acceptors.initOne(cmd.acceptor),
                 };
-                _ = self.accept(reply);
-                return reply;
-            } else return null;
+            }
+
+            if (s.learning.?.acceptors.len == self.majority()) {
+                s.chosen = cmd.value;
+            }
+            return s;
+        }
+
+        pub fn majority(self: *const Self) usize {
+            return (self.peers.len + 1) / 2 + 1;
         }
     };
 }
 
 test "it will promise to not accept proposals lower the n" {
     var proposer: Paxos(u32, 3) = .init(0, &.{ 1, 2 });
-    const old_prepare = proposer.propose(0xdeadbeef);
-    const new_prepare = proposer.propose(42);
+    const older = proposer.propose(0xdeadbeef);
+    proposer.state = older.state;
+    const newer = proposer.propose(42);
+    proposer.state = newer.state;
 
     var acceptor: Paxos(u32, 3) = .init(1, &.{ 0, 2 });
 
-    var maybe_promise = acceptor.prepare(new_prepare);
+    var result = acceptor.prepare(newer.prepare);
+    acceptor.state = result.state;
+    try testing.expect(result.promise != null);
+    try testing.expect(result.promise.?.proposal_number == proposer.state.round);
 
-    try testing.expect(maybe_promise != null);
-    try testing.expect(maybe_promise.?.proposal_number == proposer.proposal_number);
-
-    maybe_promise = acceptor.prepare(old_prepare);
-    try testing.expect(maybe_promise == null);
+    result = acceptor.prepare(older.prepare);
+    acceptor.state = result.state;
+    try testing.expect(result.promise == null);
 }
 
 test "a proposer will send an accept command if it recieves promises from a majority" {
     var proposer: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
-    const prepare = proposer.propose(0xcafe);
+    const proposal = proposer.propose(0xcafe);
+    proposer.state = proposal.state;
 
     var acc1: Paxos(u32, 5) = .init(1, &.{ 0, 2, 3, 4 });
     var acc2: Paxos(u32, 5) = .init(2, &.{ 0, 1, 3, 4 });
     var acc3: Paxos(u32, 5) = .init(3, &.{ 0, 1, 2, 4 });
     var acc4: Paxos(u32, 5) = .init(4, &.{ 0, 1, 2, 3 });
 
-    var accept: ?Paxos(u32, 5).Accept = undefined;
-
-    const acc1_promise = acc1.prepare(prepare).?;
-    accept = proposer.promise(acc1_promise);
-    try testing.expect(accept == null);
+    const p1 = acc1.prepare(proposal.prepare);
+    acc1.state = p1.state;
+    var result = proposer.promise(p1.promise.?);
+    proposer.state = result.state;
+    try testing.expect(result.accept == null);
 
     // send acc1_promise again to ensure that we
     // tolerate duplicate promises.
-    accept = proposer.promise(acc1_promise);
-    try testing.expect(accept == null);
+    result = proposer.promise(p1.promise.?);
+    proposer.state = result.state;
+    try testing.expect(result.accept == null);
 
     // third promise (including self) -> majority
-    accept = proposer.promise(acc2.prepare(prepare).?);
-    try testing.expect(accept != null);
+    const p2 = acc2.prepare(proposal.prepare);
+    acc2.state = p2.state;
+    result = proposer.promise(p2.promise.?);
+    proposer.state = result.state;
+    try testing.expect(result.accept != null);
 
-    accept = proposer.promise(acc3.prepare(prepare).?);
-    try testing.expect(accept == null);
+    const p3 = acc3.prepare(proposal.prepare);
+    acc3.state = p3.state;
+    result = proposer.promise(p3.promise.?);
+    proposer.state = result.state;
+    try testing.expect(result.accept == null);
 
-    accept = proposer.promise(acc4.prepare(prepare).?);
-    try testing.expect(accept == null);
+    const p4 = acc4.prepare(proposal.prepare);
+    acc4.state = p4.state;
+    result = proposer.promise(p4.promise.?);
+    proposer.state = result.state;
+    try testing.expect(result.accept == null);
 }
 
 test "a proposer will send an accept command with the value of the highest-numbered accepted proposal" {
     var proposer: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
-    const old_prepare = proposer.propose(0xcafe);
+    const old = proposer.propose(0xcafe);
+    proposer.state = old.state;
 
     var acc1: Paxos(u32, 5) = .init(1, &.{ 0, 2, 3, 4 });
     var acc2: Paxos(u32, 5) = .init(2, &.{ 0, 1, 3, 4 });
     var acc3: Paxos(u32, 5) = .init(3, &.{ 0, 1, 2, 4 });
     var acc4: Paxos(u32, 5) = .init(4, &.{ 0, 1, 2, 3 });
 
-    _ = proposer.promise(acc1.prepare(old_prepare).?);
-    var accept = proposer.promise(acc2.prepare(old_prepare).?).?;
-    try testing.expectEqual(0xcafe, accept.value);
+    const p1 = acc1.prepare(old.prepare);
+    acc1.state = p1.state;
+    var result = proposer.promise(p1.promise.?);
+    proposer.state = result.state;
+    const p2 = acc2.prepare(old.prepare);
+    acc2.state = p2.state;
+    result = proposer.promise(p2.promise.?);
+    proposer.state = result.state;
+    try testing.expectEqual(0xcafe, result.accept.?.value);
 
-    _ = acc1.accept(accept); // acc1 accepted 0xcafe
+    const a1 = acc1.accept(result.accept.?); // acc1 accepted 0xcafe
+    acc1.state = a1.state;
     // assume accept messages for the rest of the nodes were dropped
 
     // acc4 will act as a proposer now
-    var new_prepare = acc4.propose(0xdead);
+    const proposal = acc4.propose(0xdead);
+    acc4.state = proposal.state;
+    const p3 = acc3.prepare(proposal.prepare);
+    acc3.state = p3.state;
+    var accepted = acc4.promise(p3.promise.?);
+    acc4.state = accepted.state;
+    const p2b = acc2.prepare(proposal.prepare);
+    acc2.state = p2b.state;
+    accepted = acc4.promise(p2b.promise.?);
+    acc4.state = accepted.state;
+    try testing.expectEqual(0xdead, accepted.accept.?.value);
 
-    _ = acc4.promise(acc3.prepare(new_prepare).?);
-    accept = acc4.promise(acc2.prepare(new_prepare).?).?;
-    try testing.expectEqual(0xdead, accept.value);
-    _ = acc2.accept(accept);
+    const a2 = acc2.accept(accepted.accept.?);
+    acc2.state = a2.state;
 
     // state
     // acc1 accepted = 0xcafe
     // acc2 accepted = 0xdead
 
     // acc3 will act as a proposer now
-    acc3.proposal_number.counter += 10; // make it the highest so far
-    new_prepare = acc3.propose(0x6767);
-    _ = acc3.promise(acc1.prepare(new_prepare).?);
-    accept = acc3.promise(acc2.prepare(new_prepare).?).?;
+    acc3.state.round.counter += 10; // make it the highest so far
+    const last = acc3.propose(0x6767);
+    acc3.state = last.state;
+    const p1b = acc1.prepare(last.prepare);
+    acc1.state = p1b.state;
+    result = acc3.promise(p1b.promise.?);
+    acc3.state = result.state;
+    const p2c = acc2.prepare(last.prepare);
+    acc2.state = p2c.state;
+    result = acc3.promise(p2c.promise.?);
+    acc3.state = result.state;
 
     // the accepted was from the highest numbered proposal so far
-    try testing.expectEqual(0xdead, accept.value);
+    try testing.expectEqual(0xdead, result.accept.?.value);
 }
 
 test "a value is chosen once it is learned from the majority" {
@@ -317,17 +332,32 @@ test "a value is chosen once it is learned from the majority" {
     var acc3: Paxos(u32, 5) = .init(3, &.{ 0, 1, 2, 4 });
     var acc4: Paxos(u32, 5) = .init(4, &.{ 0, 1, 2, 3 });
 
-    const prepare = proposer.propose(42);
-    _ = proposer.promise(acc2.prepare(prepare).?);
-    const accept = proposer.promise(acc3.prepare(prepare).?).?;
+    const proposal = proposer.propose(42);
+    proposer.state = proposal.state;
+    const p2 = acc2.prepare(proposal.prepare);
+    acc2.state = p2.state;
+    var result = proposer.promise(p2.promise.?);
+    proposer.state = result.state;
+    const p3 = acc3.prepare(proposal.prepare);
+    acc3.state = p3.state;
+    result = proposer.promise(p3.promise.?);
+    proposer.state = result.state;
+    const accept = result.accept.?;
 
-    learner.learn(acc2.accept(accept).?);
-    try testing.expectEqual(null, learner.value);
-    learner.learn(acc3.accept(accept).?);
-    try testing.expectEqual(null, learner.value);
+    const a2 = acc2.accept(accept);
+    acc2.state = a2.state;
+    learner.state = learner.learn(a2.learn.?);
+    try testing.expectEqual(null, learner.state.chosen);
 
-    learner.learn(acc4.accept(accept).?);
-    try testing.expectEqual(42, learner.value);
+    const a3 = acc3.accept(accept);
+    acc3.state = a3.state;
+    learner.state = learner.learn(a3.learn.?);
+    try testing.expectEqual(null, learner.state.chosen);
+
+    const a4 = acc4.accept(accept);
+    acc4.state = a4.state;
+    learner.state = learner.learn(a4.learn.?);
+    try testing.expectEqual(42, learner.state.chosen);
 }
 
 test "it tolerates duplicate Learn requests" {
@@ -337,17 +367,30 @@ test "it tolerates duplicate Learn requests" {
     var acc3: Paxos(u32, 5) = .init(3, &.{ 0, 1, 2, 4 });
     //var acc4: Paxos(u32) = .init(4, &.{ 0, 1, 2, 3 });
 
-    const prepare = proposer.propose(42);
-    _ = proposer.promise(acc2.prepare(prepare).?);
-    const accept = proposer.promise(acc3.prepare(prepare).?).?;
+    const proposal = proposer.propose(42);
+    proposer.state = proposal.state;
+    const p2 = acc2.prepare(proposal.prepare);
+    acc2.state = p2.state;
+    var result = proposer.promise(p2.promise.?);
+    proposer.state = result.state;
+    const p3 = acc3.prepare(proposal.prepare);
+    acc3.state = p3.state;
+    result = proposer.promise(p3.promise.?);
+    proposer.state = result.state;
+    const accept = result.accept.?;
 
-    learner.learn(acc2.accept(accept).?);
-    try testing.expectEqual(null, learner.value);
-    learner.learn(acc3.accept(accept).?);
-    try testing.expectEqual(null, learner.value);
+    const a2 = acc2.accept(accept);
+    acc2.state = a2.state;
+    learner.state = learner.learn(a2.learn.?);
+    try testing.expectEqual(null, learner.state.chosen);
 
-    learner.learn(acc3.accept(accept).?);
-    try testing.expectEqual(null, learner.value);
+    const a3 = acc3.accept(accept);
+    acc3.state = a3.state;
+    learner.state = learner.learn(a3.learn.?);
+    try testing.expectEqual(null, learner.state.chosen);
+
+    learner.state = learner.learn(a3.learn.?);
+    try testing.expectEqual(null, learner.state.chosen);
 }
 
 test "a proposer must re-propose a value it has already accepted" {
@@ -355,14 +398,22 @@ test "a proposer must re-propose a value it has already accepted" {
     var acc1: Paxos(u32, 3) = .init(1, &.{ 0, 2 });
     var acc2: Paxos(u32, 3) = .init(2, &.{ 0, 1 });
 
-    const prepare1 = proposer.propose(0xdeadbeef);
-    const accept1 = proposer.promise(acc1.prepare(prepare1).?).?;
-    try testing.expectEqual(0xdeadbeef, accept1.value);
-    _ = acc1.accept(accept1);
+    const first = proposer.propose(0xdeadbeef);
+    proposer.state = first.state;
+    const pr1 = acc1.prepare(first.prepare);
+    acc1.state = pr1.state;
+    var result = proposer.promise(pr1.promise.?);
+    proposer.state = result.state;
+    try testing.expectEqual(0xdeadbeef, result.accept.?.value);
 
-    const prepare2 = proposer.propose(0xdead);
-    const accept2 = proposer.promise(acc2.prepare(prepare2).?).?;
-    try testing.expectEqual(0xdeadbeef, accept2.value);
+    const a1 = acc1.accept(result.accept.?);
+    acc1.state = a1.state;
 
-    _ = acc2.accept(accept2);
+    const second = proposer.propose(0xdead);
+    proposer.state = second.state;
+    const pr2 = acc2.prepare(second.prepare);
+    acc2.state = pr2.state;
+    result = proposer.promise(pr2.promise.?);
+    proposer.state = result.state;
+    try testing.expectEqual(0xdeadbeef, result.accept.?.value);
 }
