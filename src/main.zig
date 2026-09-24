@@ -1,4 +1,5 @@
 const std = @import("std");
+const Paxos = @import("Paxos.zig");
 const Io = std.Io;
 const mem = std.mem;
 
@@ -9,4 +10,8 @@ pub fn main(init: std.process.Init) !void {
 
     _ = args;
     _ = gpa;
+}
+
+test {
+    std.testing.refAllDecls(Paxos);
 }
