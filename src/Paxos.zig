@@ -1,4 +1,5 @@
 const std = @import("std");
+const BoundedArray = @import("BoundedArray.zig");
 const testing = std.testing;
 
 const NodeId = u16;
@@ -17,7 +18,7 @@ const ProposalNumber = packed struct(u64) {
 /// A Paxos type to reach consensus for a value of type `T`.
 ///
 /// This is a low-level implementation of the protocol, transport is handled separately.
-pub fn Paxos(comptime T: type) type {
+pub fn Paxos(comptime T: type, comptime N: usize) type {
     return struct {
         const Self = @This();
 
@@ -39,6 +40,7 @@ pub fn Paxos(comptime T: type) type {
         const Learn = struct {
             proposal_number: ProposalNumber,
             value: T,
+            acceptor: NodeId,
         };
 
         const LastAccepted = struct {
@@ -51,8 +53,8 @@ pub fn Paxos(comptime T: type) type {
             number: ProposalNumber,
             /// The value we're learning
             value: T,
-            /// The number of acceptors who accepted this
-            acceptors: usize,
+            /// Nodes who have accepted this round (i.e. sent a Learn request)
+            acceptors: BoundedArray.Bounded(NodeId, N),
         };
 
         id: NodeId,
@@ -137,6 +139,7 @@ pub fn Paxos(comptime T: type) type {
             const reply: Learn = .{
                 .proposal_number = cmd.proposal_number,
                 .value = cmd.value,
+                .acceptor = self.id,
             };
             _ = self.learn(reply);
             return reply;
@@ -144,25 +147,28 @@ pub fn Paxos(comptime T: type) type {
 
         pub fn learn(self: *Self, cmd: Learn) void {
             if (self.learningValue) |*learning| {
+                // ignore duplicate
+                if (std.mem.findScalar(NodeId, learning.acceptors.slice(), cmd.acceptor) != null)
+                    return;
                 switch (std.math.order(cmd.proposal_number.asInt(), learning.number.asInt())) {
                     .gt => {
                         self.learningValue = .{
-                            .acceptors = 1,
+                            .acceptors = .initOne(cmd.acceptor),
                             .value = cmd.value,
                             .number = cmd.proposal_number,
                         };
                     },
                     .eq => {
-                        learning.acceptors += 1;
+                        learning.acceptors.append(cmd.acceptor) catch unreachable;
                     },
                     .lt => {},
                 }
-                if (learning.acceptors == self.majority()) {
+                if (learning.acceptors.len == self.majority()) {
                     self.value = cmd.value;
                 }
             } else {
                 self.learningValue = .{
-                    .acceptors = 1,
+                    .acceptors = .initOne(cmd.acceptor),
                     .value = cmd.value,
                     .number = cmd.proposal_number,
                 };
@@ -212,11 +218,11 @@ pub fn Paxos(comptime T: type) type {
 }
 
 test "it will promise to not accept proposals lower the n" {
-    var proposer: Paxos(u32) = .init(0, &.{1});
+    var proposer: Paxos(u32, 3) = .init(0, &.{ 1, 2 });
     const old_prepare = proposer.propose(0xdeadbeef);
     const new_prepare = proposer.propose(42);
 
-    var acceptor: Paxos(u32) = .init(1, &.{0});
+    var acceptor: Paxos(u32, 3) = .init(1, &.{ 0, 2 });
 
     var maybe_promise = acceptor.prepare(new_prepare);
 
@@ -228,15 +234,15 @@ test "it will promise to not accept proposals lower the n" {
 }
 
 test "a proposer will send an accept command if it recieves promises from a majority" {
-    var proposer: Paxos(u32) = .init(0, &.{ 1, 2, 3, 4 });
+    var proposer: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
     const prepare = proposer.propose(0xcafe);
 
-    var acc1: Paxos(u32) = .init(1, &.{ 0, 2, 3, 4 });
-    var acc2: Paxos(u32) = .init(2, &.{ 0, 1, 3, 4 });
-    var acc3: Paxos(u32) = .init(3, &.{ 0, 1, 2, 4 });
-    var acc4: Paxos(u32) = .init(4, &.{ 0, 1, 2, 3 });
+    var acc1: Paxos(u32, 5) = .init(1, &.{ 0, 2, 3, 4 });
+    var acc2: Paxos(u32, 5) = .init(2, &.{ 0, 1, 3, 4 });
+    var acc3: Paxos(u32, 5) = .init(3, &.{ 0, 1, 2, 4 });
+    var acc4: Paxos(u32, 5) = .init(4, &.{ 0, 1, 2, 3 });
 
-    var accept: ?Paxos(u32).Accept = undefined;
+    var accept: ?Paxos(u32, 5).Accept = undefined;
 
     accept = proposer.promise(acc1.prepare(prepare).?);
     try testing.expect(accept == null);
@@ -253,13 +259,13 @@ test "a proposer will send an accept command if it recieves promises from a majo
 }
 
 test "a proposer will send an accept command with the value of the highest-numbered accepted proposal" {
-    var proposer: Paxos(u32) = .init(0, &.{ 1, 2, 3, 4 });
+    var proposer: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
     const old_prepare = proposer.propose(0xcafe);
 
-    var acc1: Paxos(u32) = .init(1, &.{ 0, 2, 3, 4 });
-    var acc2: Paxos(u32) = .init(2, &.{ 0, 1, 3, 4 });
-    var acc3: Paxos(u32) = .init(3, &.{ 0, 1, 2, 4 });
-    var acc4: Paxos(u32) = .init(4, &.{ 0, 1, 2, 3 });
+    var acc1: Paxos(u32, 5) = .init(1, &.{ 0, 2, 3, 4 });
+    var acc2: Paxos(u32, 5) = .init(2, &.{ 0, 1, 3, 4 });
+    var acc3: Paxos(u32, 5) = .init(3, &.{ 0, 1, 2, 4 });
+    var acc4: Paxos(u32, 5) = .init(4, &.{ 0, 1, 2, 3 });
 
     _ = proposer.promise(acc1.prepare(old_prepare).?);
     var accept = proposer.promise(acc2.prepare(old_prepare).?).?;
@@ -291,16 +297,16 @@ test "a proposer will send an accept command with the value of the highest-numbe
 }
 
 test "a value is chosen once it is learned from the majority" {
-    var learner: Paxos(u32) = .init(0, &.{ 1, 2, 3, 4 });
-    var proposer: Paxos(u32) = .init(1, &.{ 0, 2, 3, 4 });
-    var acc2: Paxos(u32) = .init(2, &.{ 0, 1, 3, 4 });
-    var acc3: Paxos(u32) = .init(3, &.{ 0, 1, 2, 4 });
-    var acc4: Paxos(u32) = .init(4, &.{ 0, 1, 2, 3 });
+    var learner: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
+    var proposer: Paxos(u32, 5) = .init(1, &.{ 0, 2, 3, 4 });
+    var acc2: Paxos(u32, 5) = .init(2, &.{ 0, 1, 3, 4 });
+    var acc3: Paxos(u32, 5) = .init(3, &.{ 0, 1, 2, 4 });
+    var acc4: Paxos(u32, 5) = .init(4, &.{ 0, 1, 2, 3 });
 
     const prepare = proposer.propose(42);
     _ = proposer.promise(acc2.prepare(prepare).?);
     const accept = proposer.promise(acc3.prepare(prepare).?).?;
-    
+
     learner.learn(acc2.accept(accept).?);
     try testing.expectEqual(null, learner.value);
     learner.learn(acc3.accept(accept).?);
@@ -308,4 +314,24 @@ test "a value is chosen once it is learned from the majority" {
 
     learner.learn(acc4.accept(accept).?);
     try testing.expectEqual(42, learner.value);
+}
+
+test "it tolerates duplicate Learn requests" {
+    var learner: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
+    var proposer: Paxos(u32, 5) = .init(1, &.{ 0, 2, 3, 4 });
+    var acc2: Paxos(u32, 5) = .init(2, &.{ 0, 1, 3, 4 });
+    var acc3: Paxos(u32, 5) = .init(3, &.{ 0, 1, 2, 4 });
+    //var acc4: Paxos(u32) = .init(4, &.{ 0, 1, 2, 3 });
+
+    const prepare = proposer.propose(42);
+    _ = proposer.promise(acc2.prepare(prepare).?);
+    const accept = proposer.promise(acc3.prepare(prepare).?).?;
+
+    learner.learn(acc2.accept(accept).?);
+    try testing.expectEqual(null, learner.value);
+    learner.learn(acc3.accept(accept).?);
+    try testing.expectEqual(null, learner.value);
+
+    learner.learn(acc3.accept(accept).?);
+    try testing.expectEqual(null, learner.value);
 }

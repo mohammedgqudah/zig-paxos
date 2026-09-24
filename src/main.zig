@@ -1,5 +1,6 @@
 const std = @import("std");
 const Paxos = @import("Paxos.zig");
+const BoundedArray = @import("BoundedArray.zig");
 const Io = std.Io;
 const mem = std.mem;
 
@@ -14,4 +15,5 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     std.testing.refAllDecls(Paxos);
+    std.testing.refAllDecls(BoundedArray);
 }
