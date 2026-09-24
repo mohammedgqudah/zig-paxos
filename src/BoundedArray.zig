@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub fn Bounded(comptime T: type, comptime capacity: usize) type {
     return struct {
         buffer: [capacity]T = undefined,
@@ -20,6 +22,10 @@ pub fn Bounded(comptime T: type, comptime capacity: usize) type {
             if (self.len >= capacity) return error.OutOfMemory;
             self.buffer[self.len] = item;
             self.len += 1;
+        }
+        
+        pub fn contains(self: *Self, item: T) bool {
+            return std.mem.findScalar(T, self.slice(), item) != null;
         }
     };
 }

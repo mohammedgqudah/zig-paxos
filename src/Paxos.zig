@@ -68,7 +68,7 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
         /// the proposed value from this node
         proposed_value: ?T = null,
         /// The number of promises for our current proposal
-        promises: usize = 0,
+        promises: BoundedArray.Bounded(NodeId, N) = .{},
         /// Store the highest-numbered accepted proposal that acceptors report
         /// back in their promise.
         /// "it responds to the request [...] with the highest-numbered proposal (if any) that it has accepted."
@@ -102,7 +102,7 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
         /// The caller should forward the `Prepare` command.
         pub fn propose(self: *Self, value: T) Prepare {
             self.proposed_value = value;
-            self.promises = 0; 
+            self.promises = .{};
             self.proposal_number.counter += 1;
             const reply: Prepare = .{
                 .proposal_number = self.proposal_number,
@@ -152,7 +152,7 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
         pub fn learn(self: *Self, cmd: Learn) void {
             if (self.learningValue) |*learning| {
                 // ignore duplicate
-                if (std.mem.findScalar(NodeId, learning.acceptors.slice(), cmd.acceptor) != null)
+                if (learning.acceptors.contains(cmd.acceptor))
                     return;
                 switch (std.math.order(cmd.proposal_number.asInt(), learning.number.asInt())) {
                     .gt => {
@@ -190,7 +190,11 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
             // ignore stale promises
             if (cmd.proposal_number != self.proposal_number)
                 return null;
-            self.promises += 1;
+
+            // ignore duplicate messages
+            if (self.promises.contains(cmd.acceptor))
+                return null;
+            self.promises.append(cmd.acceptor) catch unreachable;
 
             // store the highest-numbered accepted proposal from
             // all responses.
@@ -204,7 +208,7 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
                 self.best_accepted = last_accepted;
             }
 
-            if (self.promises == self.majority()) {
+            if (self.promises.len == self.majority()) {
                 const reply: Accept = .{
                     .proposal_number = cmd.proposal_number,
                     // either send our proposed value, or propagate the value of the highest
@@ -248,7 +252,13 @@ test "a proposer will send an accept command if it recieves promises from a majo
 
     var accept: ?Paxos(u32, 5).Accept = undefined;
 
-    accept = proposer.promise(acc1.prepare(prepare).?);
+    const acc1_promise = acc1.prepare(prepare).?;
+    accept = proposer.promise(acc1_promise);
+    try testing.expect(accept == null);
+
+    // send acc1_promise again to ensure that we
+    // tolerate duplicate promises.
+    accept = proposer.promise(acc1_promise);
     try testing.expect(accept == null);
 
     // third promise (including self) -> majority
@@ -319,7 +329,6 @@ test "a value is chosen once it is learned from the majority" {
     learner.learn(acc4.accept(accept).?);
     try testing.expectEqual(42, learner.value);
 }
-
 
 test "it tolerates duplicate Learn requests" {
     var learner: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
