@@ -102,12 +102,16 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
         /// The caller should forward the `Prepare` command.
         pub fn propose(self: *Self, value: T) Prepare {
             self.proposed_value = value;
-            self.promises = 1; // self-promise
+            self.promises = 0; 
             self.proposal_number.counter += 1;
-            self.best_accepted = null;
-            return .{
+            const reply: Prepare = .{
                 .proposal_number = self.proposal_number,
             };
+            // self-promise, but only if we haven't promised a higher numbered round.
+            if (self.prepare(reply)) |p| {
+                _ = self.promise(p);
+            }
+            return reply;
         }
 
         /// role: acceptor
@@ -316,6 +320,7 @@ test "a value is chosen once it is learned from the majority" {
     try testing.expectEqual(42, learner.value);
 }
 
+
 test "it tolerates duplicate Learn requests" {
     var learner: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
     var proposer: Paxos(u32, 5) = .init(1, &.{ 0, 2, 3, 4 });
@@ -334,4 +339,21 @@ test "it tolerates duplicate Learn requests" {
 
     learner.learn(acc3.accept(accept).?);
     try testing.expectEqual(null, learner.value);
+}
+
+test "a proposer must re-propose a value it has already accepted" {
+    var proposer: Paxos(u32, 3) = .init(0, &.{ 1, 2 });
+    var acc1: Paxos(u32, 3) = .init(1, &.{ 0, 2 });
+    var acc2: Paxos(u32, 3) = .init(2, &.{ 0, 1 });
+
+    const prepare1 = proposer.propose(0xdeadbeef);
+    const accept1 = proposer.promise(acc1.prepare(prepare1).?).?;
+    try testing.expectEqual(0xdeadbeef, accept1.value);
+    _ = acc1.accept(accept1);
+
+    const prepare2 = proposer.propose(0xdead);
+    const accept2 = proposer.promise(acc2.prepare(prepare2).?).?;
+    try testing.expectEqual(0xdeadbeef, accept2.value);
+
+    _ = acc2.accept(accept2);
 }
