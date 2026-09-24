@@ -36,9 +36,23 @@ pub fn Paxos(comptime T: type) type {
             value: T,
         };
 
+        const Learn = struct {
+            proposal_number: ProposalNumber,
+            value: T,
+        };
+
         const LastAccepted = struct {
             proposal_number: ProposalNumber,
             value: T,
+        };
+
+        const LearnerState = struct {
+            /// The we're learning about
+            number: ProposalNumber,
+            /// The value we're learning
+            value: T,
+            /// The number of acceptors who accepted this
+            acceptors: usize,
         };
 
         id: NodeId,
@@ -62,6 +76,10 @@ pub fn Paxos(comptime T: type) type {
         /// The promised proposal number
         promised_number: ?ProposalNumber = null,
         accepted: ?LastAccepted = null,
+
+        /// role: learning
+        /// the value we're learning
+        learningValue: ?LearnerState = null,
 
         pub fn init(
             node_id: NodeId,
@@ -105,17 +123,50 @@ pub fn Paxos(comptime T: type) type {
             }
         }
 
-        pub fn accept(self: *Self, cmd: Accept) void {
+        pub fn accept(self: *Self, cmd: Accept) ?Learn {
             // make sure we haven't promised a higher-numbered proposal
             if (self.promised_number) |promised_number| {
                 if (promised_number.asInt() > cmd.proposal_number.asInt()) {
-                    return;
+                    return null;
                 }
             }
             self.accepted = .{
                 .proposal_number = cmd.proposal_number,
                 .value = cmd.value,
             };
+            const reply: Learn = .{
+                .proposal_number = cmd.proposal_number,
+                .value = cmd.value,
+            };
+            _ = self.learn(reply);
+            return reply;
+        }
+
+        pub fn learn(self: *Self, cmd: Learn) void {
+            if (self.learningValue) |*learning| {
+                switch (std.math.order(cmd.proposal_number.asInt(), learning.number.asInt())) {
+                    .gt => {
+                        self.learningValue = .{
+                            .acceptors = 1,
+                            .value = cmd.value,
+                            .number = cmd.proposal_number,
+                        };
+                    },
+                    .eq => {
+                        learning.acceptors += 1;
+                    },
+                    .lt => {},
+                }
+                if (learning.acceptors == self.majority()) {
+                    self.value = cmd.value;
+                }
+            } else {
+                self.learningValue = .{
+                    .acceptors = 1,
+                    .value = cmd.value,
+                    .number = cmd.proposal_number,
+                };
+            }
         }
 
         pub fn majority(self: *const Self) usize {
@@ -153,7 +204,7 @@ pub fn Paxos(comptime T: type) type {
                     else
                         self.proposed_value.?,
                 };
-                self.accept(reply);
+                _ = self.accept(reply);
                 return reply;
             } else return null;
         }
@@ -237,4 +288,24 @@ test "a proposer will send an accept command with the value of the highest-numbe
 
     // the accepted was from the highest numbered proposal so far
     try testing.expectEqual(0xdead, accept.value);
+}
+
+test "a value is chosen once it is learned from the majority" {
+    var learner: Paxos(u32) = .init(0, &.{ 1, 2, 3, 4 });
+    var proposer: Paxos(u32) = .init(1, &.{ 0, 2, 3, 4 });
+    var acc2: Paxos(u32) = .init(2, &.{ 0, 1, 3, 4 });
+    var acc3: Paxos(u32) = .init(3, &.{ 0, 1, 2, 4 });
+    var acc4: Paxos(u32) = .init(4, &.{ 0, 1, 2, 3 });
+
+    const prepare = proposer.propose(42);
+    _ = proposer.promise(acc2.prepare(prepare).?);
+    const accept = proposer.promise(acc3.prepare(prepare).?).?;
+    
+    learner.learn(acc2.accept(accept).?);
+    try testing.expectEqual(null, learner.value);
+    learner.learn(acc3.accept(accept).?);
+    try testing.expectEqual(null, learner.value);
+
+    learner.learn(acc4.accept(accept).?);
+    try testing.expectEqual(42, learner.value);
 }
