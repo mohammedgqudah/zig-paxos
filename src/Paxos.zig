@@ -92,7 +92,7 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
         }
 
         /// role: acceptor
-        /// Recieve a prepare command, and potentionally promise the proposer.
+        /// Receive a prepare command, and potentially promise the proposer.
         pub fn prepare(self: *const Self, cmd: Prepare) PrepareResult {
             var s = self.state;
             if (s.promised == null or cmd.proposal_number.asInt() > s.promised.?.asInt()) {
@@ -110,7 +110,7 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
         }
 
         /// role: proposer
-        /// Recieve a promise for a proposal and send
+        /// Receive a promise for a proposal and send
         /// an `Accept` command once the majority has promised.
         pub fn promise(self: *const Self, cmd: Promise) PromiseResult {
             var s = self.state;
@@ -222,7 +222,7 @@ test "it will promise to not accept proposals lower the n" {
     try testing.expect(result.promise == null);
 }
 
-test "a proposer will send an accept command if it recieves promises from a majority" {
+test "a proposer will send an accept command if it receives promises from a majority" {
     var proposer: Paxos(u32, 5) = .init(0, &.{ 1, 2, 3, 4 });
     const proposal = proposer.propose(0xcafe);
     proposer.state = proposal.state;

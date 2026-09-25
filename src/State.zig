@@ -11,10 +11,10 @@ pub fn State(comptime T: type, comptime N: usize) type {
 
         pub const Last = LastAccepted(T);
 
-        pub const Acceptors = BoundedArray.Bounded(NodeId, N + 1);
+        pub const Acceptors = BoundedArray.Bounded(NodeId, N);
 
         pub const Learning = struct {
-            /// The we're learning about
+            /// The round we're learning about
             number: ProposalNumber,
             /// The value we're learning
             value: T,
