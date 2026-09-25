@@ -73,6 +73,47 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
             return .{ .id = self.id, .peers = self.peers, .state = s };
         }
 
+        pub const Message = union(enum) {
+            prepare: Prepare,
+            promise: Promise,
+            learn: Learn,
+            accept: Accept,
+        };
+
+        pub const Result = struct {
+            state: PaxosState,
+            message: ?Message,
+        };
+
+        /// Apply an incoming message and return the resulting state
+        /// with an optional message to forward to peers.
+        pub fn apply(self: *const Self, message: Message) Result {
+            switch (message) {
+                .prepare => |cmd| {
+                    const result = self.prepare(cmd);
+                    return .{
+                        .state = result.state,
+                        .message = if (result.promise) |msg| .{ .promise = msg } else null,
+                    };
+                },
+                .promise => |cmd| {
+                    const result = self.promise(cmd);
+                    return .{
+                        .state = result.state,
+                        .message = if (result.accept) |msg| .{ .accept = msg } else null,
+                    };
+                },
+                .accept => |cmd| {
+                    const result = self.accept(cmd);
+                    return .{
+                        .state = result.state,
+                        .message = if (result.learn) |msg| .{ .learn = msg } else null,
+                    };
+                },
+                .learn => |cmd| return .{ .state = self.learn(cmd), .message = null },
+            }
+        }
+
         /// Propose a value to peers.
         /// The caller should forward the `Prepare` command.
         pub fn propose(self: *const Self, value: T) ProposeResult {
@@ -201,6 +242,37 @@ pub fn Paxos(comptime T: type, comptime N: usize) type {
             return (self.peers.len + 1) / 2 + 1;
         }
     };
+}
+
+test "apply dispatches messages to the right role and forwards the result" {
+    var proposer: Paxos(u32, 3) = .init(0, &.{ 1, 2 });
+    const proposal = proposer.propose(0xdeadbeef);
+    proposer.state = proposal.state;
+
+    var acceptor: Paxos(u32, 3) = .init(1, &.{ 0, 2 });
+
+    var result = acceptor.apply(.{ .prepare = proposal.prepare });
+    acceptor.state = result.state;
+    try testing.expect(result.message != null);
+    try testing.expect(result.message.? == .promise);
+
+    result = proposer.apply(result.message.?);
+    proposer.state = result.state;
+    try testing.expect(result.message != null);
+    try testing.expect(result.message.? == .accept);
+    try testing.expectEqual(0xdeadbeef, result.message.?.accept.value);
+
+    result = acceptor.apply(result.message.?);
+    acceptor.state = result.state;
+    try testing.expect(result.message != null);
+    try testing.expect(result.message.? == .learn);
+    try testing.expectEqual(0xdeadbeef, result.message.?.learn.value);
+
+    result = proposer.apply(result.message.?);
+    proposer.state = result.state;
+    // learn forwards nothing
+    try testing.expect(result.message == null);
+    try testing.expectEqual(0xdeadbeef, proposer.state.chosen.?);
 }
 
 test "it will promise to not accept proposals lower the n" {
